@@ -1,0 +1,532 @@
+openapi: 3.0.3
+info:
+  title: Policy Upload Assessment API
+  version: 1.0.0
+  description: |
+    Node.js + Express + MongoDB API for the policy-upload assessment.
+
+    **Task 1**
+    - 1.1 Upload an XLSX/CSV sheet; it is parsed and written to MongoDB inside a worker thread.
+    - 1.2 Search policy info by username (the user's first name).
+    - 1.3 Aggregated policies grouped by user.
+    - 1.4 Data lives in separate collections: agents, users, accounts, lobs, carriers, policies.
+
+    **Task 2**
+    - 2.1 CPU usage is tracked in real time and the server is replaced when it crosses the threshold (default 70%). See `GET /health` and `GET /debug/cpu-burn`.
+    - 2.2 Schedule a message for a day and time; it is inserted into the `messages` collection when that moment arrives.
+
+    All error responses share the shape `{ "message": "..." }`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://localhost:3000/api
+    description: Local development
+
+# The API has no authentication.
+security: []
+
+tags:
+  - name: Upload
+    description: Task 1.1, import XLSX/CSV through a worker thread
+  - name: Policies
+    description: Task 1.2 and 1.3, search and aggregation
+  - name: Messages
+    description: Task 2.2, scheduled messages
+  - name: System
+    description: Task 2.1, health, CPU and restart demo
+
+paths:
+  /upload:
+    post:
+      tags: [Upload]
+      summary: Upload an XLSX/CSV sheet into MongoDB
+      description: |
+        Saves the file, then parses it and writes it to MongoDB in a **worker thread**, so the main
+        event loop keeps serving other requests during the import. Collections are written with batched
+        `bulkWrite` upserts in dependency order (agents, LOBs, carriers, then users, accounts, policies).
+
+        Re-uploading the same file updates existing records instead of creating duplicates:
+        agents, LOBs and carriers match on name; users on email (or first name + phone when there is no email);
+        accounts on name + user; policies on policy number.
+
+        Headers are matched case-insensitively, ignoring spaces, `_` and `-`. Expected columns:
+        `agent`, `firstname` (full name, e.g. "Lura Lucca"), `dob`, `address`, `city`, `phone`, `state`, `zip`,
+        `email`, `gender`, `userType`, `account_name`, `account_type`, `category_name`, `company_name`,
+        `policy_number`, `policy_start_date`, `policy_end_date`, `policy_mode`, `policy_type`,
+        `premium_amount`, `premium_amount_written`, `producer`, `csr`. Other columns are ignored.
+
+        Dates can be Excel date cells, `M/D/YYYY` text (`11/2/2018`) or ISO strings, and are stored at UTC
+        midnight. Zips keep leading zeros and ZIP+4 (`27101-3843`). Blank cells are not stored.
+
+        The request returns when the import finishes.
+      operationId: uploadFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: A `.csv`, `.xlsx` or `.xls` file, up to 50 MB.
+      responses:
+        '201':
+          description: File imported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResult'
+        '400':
+          description: No file attached, or the file type is not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingFile:
+                  summary: No file in the "file" field
+                  value: { message: 'Attach a .csv or .xlsx file in the "file" field' }
+                wrongType:
+                  summary: Unsupported extension
+                  value: { message: 'Only .csv, .xlsx, .xls files are accepted' }
+        '413':
+          description: File larger than 50 MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { message: 'File too large' }
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /policies/search:
+    get:
+      tags: [Policies]
+      summary: Search policy info by username
+      description: |
+        The sheet has no username column, so the name in its `firstname` column is the username. That
+        column holds the full name ("Lura Lucca").
+
+        Matching is case-insensitive. By default the query must match whole leading words: `Lura` and
+        `lura lucca` both find "Lura Lucca", but `Lu` and `Lucca` don't. Pass `partial=true` to match
+        anywhere in the name.
+        Returns each matching user with their policies (newest start date first). Each policy carries its
+        category, carrier and agent names.
+      operationId: searchByUsername
+      parameters:
+        - name: username
+          in: query
+          required: true
+          description: The user's name, or its leading word(s).
+          schema: { type: string, example: Lura }
+        - name: partial
+          in: query
+          required: false
+          description: '`true` to match anywhere in the name instead of whole leading words.'
+          schema: { type: string, enum: ['true', 'false'], default: 'false' }
+      responses:
+        '200':
+          description: Matching users with their policies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResult'
+        '400':
+          description: '`username` is missing'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { message: 'Query parameter "username" is required' }
+        '404':
+          description: No user matches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: 'No user found for "Bob"' }
+                  data: { type: array, items: {}, example: [] }
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /policies/aggregate:
+    get:
+      tags: [Policies]
+      summary: Aggregated policies per user
+      description: |
+        A MongoDB aggregation pipeline that groups policies by user. Each entry has the policy count,
+        total premium, earliest start date, latest end date, distinct categories and carriers, and the
+        policy list. Sorted by policy count (descending), then name. Paginated.
+      operationId: aggregateByUser
+      parameters:
+        - name: page
+          in: query
+          description: Page number, 1-based.
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: limit
+          in: query
+          description: Users per page (1 to 500).
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: One page of users with their aggregated policies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AggregateResult'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /messages/schedule:
+    post:
+      tags: [Messages]
+      summary: Schedule a message for a day and time
+      description: |
+        Stores the request in `scheduledmessages` with its computed `runAt` and `status: "pending"`.
+        A scheduler checks every second and, once `runAt` arrives, inserts the message into the
+        `messages` collection and marks the schedule `done`.
+
+        Schedules are kept in MongoDB, not in-memory timers, so they survive a CPU-triggered restart or a crash.
+        Day and time are read in the **server's local timezone**.
+      operationId: scheduleMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleRequest'
+            examples:
+              byDate:
+                summary: Specific date
+                value: { message: Hello, day: '2026-10-20', time: '14:30' }
+              byWeekday:
+                summary: Next Monday, 12-hour time
+                value: { message: Weekly reminder, day: monday, time: '09:00 AM' }
+      responses:
+        '201':
+          description: Message scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Message scheduled }
+                  data: { $ref: '#/components/schemas/ScheduledMessage' }
+        '400':
+          description: Missing field, bad day/time format, invalid date, or a time in the past
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing:
+                  value: { message: 'Body must include "message", "day" and "time"' }
+                badTime:
+                  value: { message: '"time" must look like HH:mm, HH:mm:ss or hh:mm AM/PM' }
+                badDay:
+                  value: { message: '"day" must be a date (YYYY-MM-DD) or a weekday name such as "monday"' }
+                invalidDate:
+                  value: { message: '"2026-02-30" is not a valid date' }
+                past:
+                  value: { message: 'The given day and time is in the past' }
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /messages/scheduled:
+    get:
+      tags: [Messages]
+      summary: List scheduled messages
+      description: All schedules, sorted by `runAt` ascending. Optionally filter by status.
+      operationId: listScheduled
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, processing, done, failed]
+      responses:
+        '200':
+          description: Scheduled messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ScheduledMessage' }
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /messages:
+    get:
+      tags: [Messages]
+      summary: List delivered messages
+      description: Messages the scheduler has already inserted, newest `scheduledFor` first.
+      operationId: listMessages
+      responses:
+        '200':
+          description: Delivered messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Message' }
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /health:
+    get:
+      tags: [System]
+      summary: Health and live CPU usage
+      description: |
+        Reports the serving process and its latest CPU sample. After a CPU-triggered restart the `pid` changes.
+        With `cpuScope: process`, 100% means one core fully busy; worker-thread CPU counts too, so it can exceed 100%.
+      operationId: health
+      responses:
+        '200':
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /debug/cpu-burn:
+    get:
+      tags: [System]
+      summary: Burn CPU to demo the auto restart
+      description: |
+        **Only registered when `ENABLE_DEBUG_ROUTES=true`** (returns 404 otherwise).
+        Responds immediately, then blocks the event loop for the given number of seconds, which pushes CPU
+        above the threshold. The supervisor starts a replacement process and retires this one; call
+        `GET /health` a few seconds later to see a new `pid`.
+      operationId: cpuBurn
+      parameters:
+        - name: seconds
+          in: query
+          description: How long to burn CPU (capped at 60).
+          schema: { type: integer, minimum: 1, maximum: 60, default: 10 }
+      responses:
+        '200':
+          description: Burn started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: 'Burning CPU for 5s on pid 992' }
+        '404':
+          description: Debug routes are disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { message: Route not found }
+
+components:
+  responses:
+    ServerError:
+      description: Unexpected server or database error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { message: Internal server error }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        message: { type: string }
+
+    ObjectId:
+      type: string
+      pattern: '^[a-f0-9]{24}$'
+      example: 6710f2a3c1d4e5f601234567
+
+    UploadResult:
+      type: object
+      properties:
+        message: { type: string, example: File imported }
+        file: { type: string, description: Original file name, example: data-sheet.xlsx }
+        totalRows: { type: integer, description: Data rows in the sheet, example: 50 }
+        imported: { type: integer, description: Rows written to the database, example: 50 }
+        skipped:
+          type: array
+          description: Rows skipped for missing required values (row numbers match the spreadsheet).
+          items:
+            type: object
+            properties:
+              row: { type: integer, example: 7 }
+              reason: { type: string, enum: [missing policy number, missing first name] }
+        counts:
+          type: object
+          description: Distinct records written per collection.
+          properties:
+            agents: { type: integer, example: 1 }
+            users: { type: integer, example: 9 }
+            accounts: { type: integer, example: 9 }
+            lobs: { type: integer, example: 3 }
+            carriers: { type: integer, example: 5 }
+            policies: { type: integer, example: 50 }
+        unmappedFields:
+          type: array
+          description: Expected fields whose column was not found in the sheet headers.
+          items: { type: string }
+          example: []
+        durationMs: { type: integer, example: 137 }
+
+    User:
+      type: object
+      properties:
+        _id: { $ref: '#/components/schemas/ObjectId' }
+        firstName: { type: string, description: Full name from the sheet's `firstname` column, example: Lura Lucca }
+        dob: { type: string, format: date-time, example: '1960-02-11T00:00:00.000Z' }
+        address: { type: string, example: 170 MATTHIAS CT }
+        city: { type: string, example: MOCKSVILLE }
+        phoneNumber: { type: string, example: '8677356559' }
+        state: { type: string, example: NC }
+        zipCode: { type: string, description: 5-digit or ZIP+4, example: '27028' }
+        email: { type: string, format: email, example: madler@yahoo.ca }
+        gender: { type: string, description: Omitted when blank in the sheet, example: Male }
+        userType: { type: string, example: Active Client }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    PolicyDetail:
+      type: object
+      description: A policy with its category, carrier and agent names resolved.
+      properties:
+        _id: { $ref: '#/components/schemas/ObjectId' }
+        policyNumber: { type: string, example: YEEX9MOIBU7X }
+        policyStartDate: { type: string, format: date-time, example: '2018-11-02T00:00:00.000Z' }
+        policyEndDate: { type: string, format: date-time, example: '2019-11-02T00:00:00.000Z' }
+        policyMode: { type: number, description: Term in months, example: 12 }
+        policyType: { type: string, example: Single }
+        premiumAmount: { type: number, example: 1180.83 }
+        premiumAmountWritten: { type: number }
+        producer: { type: string, example: Brandie Placencia }
+        csr: { type: string, example: Tami Ellison }
+        policyCategoryId: { $ref: '#/components/schemas/ObjectId' }
+        companyId: { $ref: '#/components/schemas/ObjectId' }
+        userId: { $ref: '#/components/schemas/ObjectId' }
+        agentId: { $ref: '#/components/schemas/ObjectId' }
+        category: { type: string, example: Commercial Auto }
+        carrier: { type: string, example: Integon Gen Ins Corp }
+        agent: { type: string, example: Alex Watson }
+
+    SearchResult:
+      type: object
+      properties:
+        count: { type: integer, description: Total policies across all matched users, example: 6 }
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              user: { $ref: '#/components/schemas/User' }
+              policies:
+                type: array
+                items: { $ref: '#/components/schemas/PolicyDetail' }
+
+    AggregatedPolicy:
+      type: object
+      properties:
+        _id: { $ref: '#/components/schemas/ObjectId' }
+        policyNumber: { type: string, example: YEEX9MOIBU7X }
+        policyStartDate: { type: string, format: date-time, example: '2018-11-02T00:00:00.000Z' }
+        policyEndDate: { type: string, format: date-time, example: '2019-11-02T00:00:00.000Z' }
+        policyType: { type: string, example: Single }
+        premiumAmount: { type: number, example: 1180.83 }
+        category: { type: string, example: Commercial Auto }
+        carrier: { type: string, example: Integon Gen Ins Corp }
+        agent: { type: string, example: Alex Watson }
+
+    UserPolicySummary:
+      type: object
+      properties:
+        userId: { $ref: '#/components/schemas/ObjectId' }
+        firstName: { type: string, example: Lura Lucca }
+        email: { type: string, example: madler@yahoo.ca }
+        userType: { type: string, example: Active Client }
+        totalPolicies: { type: integer, example: 6 }
+        totalPremium: { type: number, description: 'Sum of premiumAmount, rounded to 2 decimals', example: 7793.48 }
+        firstPolicyStart: { type: string, format: date-time, example: '2018-11-02T00:00:00.000Z' }
+        lastPolicyEnd: { type: string, format: date-time, example: '2024-11-02T00:00:00.000Z' }
+        categories: { type: array, items: { type: string }, example: [Commercial Auto] }
+        carriers: { type: array, items: { type: string }, example: [Integon Gen Ins Corp] }
+        policies:
+          type: array
+          items: { $ref: '#/components/schemas/AggregatedPolicy' }
+
+    AggregateResult:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        limit: { type: integer, example: 50 }
+        totalUsers: { type: integer, example: 9 }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/UserPolicySummary' }
+
+    ScheduleRequest:
+      type: object
+      required: [message, day, time]
+      properties:
+        message:
+          type: string
+          example: Hello
+        day:
+          type: string
+          description: A date `YYYY-MM-DD`, or a weekday name such as `monday` (its next occurrence).
+          example: '2026-10-20'
+        time:
+          type: string
+          description: '`HH:mm`, `HH:mm:ss` or `hh:mm AM/PM`, in the server''s local timezone.'
+          example: '14:30'
+
+    ScheduledMessage:
+      type: object
+      properties:
+        _id: { $ref: '#/components/schemas/ObjectId' }
+        message: { type: string, example: Hello }
+        day: { type: string, example: '2026-10-20' }
+        time: { type: string, example: '14:30' }
+        runAt: { type: string, format: date-time, description: Computed moment the message is inserted }
+        status: { type: string, enum: [pending, processing, done, failed], example: pending }
+        insertedMessageId:
+          allOf: [{ $ref: '#/components/schemas/ObjectId' }]
+          description: Set once the message is inserted (status `done`).
+        error: { type: string, description: Set when status is `failed`. }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Message:
+      type: object
+      properties:
+        _id: { $ref: '#/components/schemas/ObjectId' }
+        message: { type: string, example: Hello }
+        scheduledFor: { type: string, format: date-time }
+        scheduleId: { $ref: '#/components/schemas/ObjectId' }
+        createdAt: { type: string, format: date-time, description: When the scheduler actually inserted it }
+        updatedAt: { type: string, format: date-time }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, example: ok }
+        pid: { type: integer, example: 1150 }
+        uptimeSeconds: { type: integer, example: 42 }
+        cpuPercent: { type: number, example: 3.2 }
+        cpuThreshold: { type: number, example: 70 }
+        cpuScope: { type: string, enum: [process, system], example: process }
+        cores: { type: integer, example: 8 }

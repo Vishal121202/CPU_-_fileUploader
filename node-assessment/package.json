@@ -1,0 +1,26 @@
+{
+  "name": "policy-upload-assessment",
+  "version": "1.0.0",
+  "description": "Node.js + MongoDB assessment: XLSX/CSV upload via worker threads, policy search/aggregation, CPU-based auto restart, scheduled messages",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:app": "node src/server.js",
+    "sample": "node scripts/generateSample.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "csv-parse": "^5.6.0",
+    "dotenv": "^16.6.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.22.3",
+    "mongoose": "^8.24.5",
+    "multer": "^2.4.0",
+    "swagger-ui-express": "^5.0.1",
+    "xlsx": "^0.18.5",
+    "yaml": "^2.9.1"
+  }
+}
